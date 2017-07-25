@@ -1,7 +1,7 @@
 #!/bin/env bash
-
+# shellcheck disable=SC2155
 # global vars
-LIST_FILE="~/package-list"
+LIST_FILE="$HOME/package-list"
 NO_CONFIRM=""
 
 redrawProgressBar() { # int barsize, int base, int i, int top
@@ -10,95 +10,132 @@ redrawProgressBar() { # int barsize, int base, int i, int top
     local current=$3
     local top=$4
     local j=0
-    local progress=$(( ($barsize * ( $current - $base )) / ($top - $base ) ))
+    local progress=$(( (barsize * ( current - base )) / (top - base ) ))
     echo -n "["
-    for ((j=0; j < $progress; j++)); do
+    for ((j=0; j < progress; j++)); do
         echo -n '='
     done
     echo -n '=>'
-    for ((j=$progress; j < $barsize ; j++)); do
+    for ((j=progress; j < barsize ; j++)); do
         echo -n ' '
     done
-    echo -n "] $(( $current )) / $top " $'\r'
+    echo -n "] $current / $top " $'\r'
+}
+getPackageInfo() {
+    local package="$1"
+    local description="$(pacman -Qi "$package" | grep Description | cut -d: -f2)"
+
+    local info="$(yaourt -Qe "$package")"
+    local repository="$(echo "$info" | cut -d' ' -f1 | cut -d/ -f1)"
+    local groups="$(echo "$info" | cut -d' ' -f3-)"
+    if [ ${#package} -ge 24 ]; then
+        printf "%s # %s\n" "$package" "${repository}${groups}${description}"
+    else
+        printf "%-24s # %s\n" "$package" "${repository}${groups}${description}"
+    fi
 }
 addSection() {
     local list=($1)
     local section=$2
     local comment=$3
     if [ -z "$comment" ]; then
-        echo "${section}=( # {{{" >> $LIST_FILE
+        echo "${section}=( # {{{" >> "$LIST_FILE"
     else
-        echo "${section}=( # {{{ $comment" >> $LIST_FILE
+        echo "${section}=( # {{{ $comment" >> "$LIST_FILE"
     fi
     for i in "${!list[@]}"; do
-        redrawProgressBar 50 0 $i ${#list[@]}
         local package=${list[i]}
-        local info=$(yaourt -Qe $package)
-        local repository=$(echo $info | cut -d' ' -f1 | cut -d/ -f1)
-        local group=$(echo $info | cut -d' ' -f3-)
-        local extrainfo="$repository $group"
-        if [ ${#package} -ge 30 ] || [ ${#extrainfo} -ge 50 ]; then
-            echo "$package" >> $LIST_FILE
-        else
-            printf "%-30s # %-50s\n" "$package" "$repository $group"\
-                >> $LIST_FILE
-        fi
+        getPackageInfo "$package" >> "$LIST_FILE"
+        redrawProgressBar 50 0 "$i" ${#list[@]}
     done
-    echo ") # }}}" >> $LIST_FILE
+    echo ") # }}}" >> "$LIST_FILE"
+}
+filterList() {
+    local comments='/^\s*#.*/d'
+    local inlinecomments='s/#.*$//'
+    local syntax='/\([[:alnum:]]*=(\)\|\(^)\)/d'
+    sed -e "$comments" -e "$inlinecomments" -e "$syntax" "$LIST_FILE" \
+            | while read -r package; do
+        echo "$package"
+    done
 }
 createInitialPackageList() {
     # write package-list
-    echo "# package-list for $0" > $LIST_FILE
+    echo "# package-list for $0" > "$LIST_FILE"
     addSection "" "NEW_PACKAGES" "new packages will be added here"
     addSection "$(pacman -Qqen)" "NATIVE_PACKAGES"
     addSection "$(yaourt -Qema | grep -v ^local | cut -d' ' -f1 | cut -d/ -f2)"\
         "AUR_PACKAGES"
     addSection "$(yaourt -Qema | grep ^local | cut -d' ' -f1 | cut -d/ -f2)"\
         "LOCAL_PACKAGES" "true local packages, not from aur"
-    echo "# vim: foldmethod=marker foldmarker={{{,}}}" >> $LIST_FILE
+    echo "# vim: foldmethod=marker foldmarker={{{,}}}" >> "$LIST_FILE"
     echo ""
     echo "You can now edit your package list!"
 }
 updatePackageList() {
-    for package in $(yaourt -Qqe); do
-        if ! grep --quiet $package $LIST_FILE; then
-            local repository=$(yaourt -Qe $package | cut -d' ' -f1 | cut -d/ -f1)
-            echo "adding $package # $repository"
+    for package in $(pacman -Qqe); do
+        if ! grep --quiet "^$package" "$LIST_FILE"; then
+            echo "adding: $package"
+            local line="$(getPackageInfo "$package")"
             if [ -z "$DRY_RUN" ]; then
-                sed -i "/NEW_PACKAGES=(/a $package # $repository" $LIST_FILE
+                sed -i "/NEW_PACKAGES=(/a $line" "$LIST_FILE"
             fi
         fi
     done
 }
-filterList() {
-    local comments='/^\s*#.*/d'
-    local inlinecomments='s/#.*$//'
-    local syntax='/=(\|)/d'
-    for package in $(sed -e "$comments" -e "$inlinecomments" -e "$syntax" \
-            $LIST_FILE); do
-        echo $package
+updatePackageListInfo() {
+    local list=($(filterList))
+    for i in "${!list[@]}"; do
+        local package="${list[i]}"
+        local line="$(getPackageInfo "$package")"
+        # escape replacement string
+        line=$(echo "$line" | sed 's/[\/&]/\\&/g')
+        sed -i "s/^$package\( \|$\).*/$line/" "$LIST_FILE"
+        redrawProgressBar 50 0 "$i" ${#list[@]}
+    done
+}
+checkDuplicates() {
+    local dupes="$(filterList | sort | uniq --repeated)"
+    if ! [ -z "$dupes" ]; then
+        echo duplicates:
+        echo "$dupes"
+        echo "Duplicates in list detected, please check this. Aborting.."
+        exit 1
+    fi
+}
+cleanMissing() {
+    local list=($(filterList))
+    for i in "${!list[@]}"; do
+        local package="${list[i]}"
+        if ! (pacman -Qq "$package" &> /dev/null); then
+            echo "removing from list: $package"
+            if [ -z "$DRY_RUN" ]; then
+                sed -i "/^$package\( \|$\)/d" "$LIST_FILE"
+            fi
+        fi
+        redrawProgressBar 50 0 "$i" ${#list[@]}
     done
 }
 installMissing() {
     local list=($(filterList))
     for i in "${!list[@]}"; do
         local package="${list[i]}"
-        if ! (yaourt -Qq $package > /dev/null); then
-            echo "installing $package"
+        if ! (pacman -Qq "$package" &> /dev/null); then
+            echo "installing: $package"
             if [ -z "$DRY_RUN" ]; then
-                yaourt -S --needed $NO_CONFIRM $package
+                yaourt -S --needed $NO_CONFIRM "$package"
             fi
         fi
-        redrawProgressBar 50 0 $i ${#list[@]}
+        redrawProgressBar 50 0 "$i" ${#list[@]}
     done
     echo ""
 }
 removePackages() {
     for package in $(pacman -Qqe); do
-        if ! (grep --quiet $package $LIST_FILE); then
+        if ! (grep --quiet "^$package" "$LIST_FILE"); then
             echo "removing $package"
             if [ -z "$DRY_RUN" ]; then
-                sudo pacman -Rns $NO_CONFIRM $package
+                sudo pacman -Rns $NO_CONFIRM "$package"
             fi
         fi
     done
@@ -111,22 +148,34 @@ and group your packages.
     USAGE: $0 [OPTIONS] OPERATION
 
     Available OPERATIONs:
-        install
-            Install all missing packages.
+        remove
+            Removes all packages (pacman -Rns) that are installed but not in
+            the package-list.
 
         update
-            TODO: packages that are not installed are removed. rename to sync
             Update the package list. (New packages are added to the section
             'NEW_PACKAGES')
 
-        remove
-            Removes all packages that are installed but not in the
-            package-list.
+        install
+            Install all missing packages.
+
+        clean
+            Removes missing packages from the list.
+
+        update-info
+            Update the extra information in the package list.
+            [package]  # [repo] [(groups)] [description]
+            Notes: Can only update info for installed packages. Replaces the
+            whole line. If you want personal comments, add them in a line above
+            the package.
+
 
     If multiple operations are given they are carried out in the order:
         1. remove
         2. update
         3. install
+        4. clean
+        5. update-info
 
     OPTIONS:
     -h --help
@@ -185,6 +234,14 @@ commandLineInterface() {
                 shift
                 local do_update=1
                 ;;
+            update-info)
+                shift
+                local do_update_info=1
+                ;;
+            clean)
+                shift
+                local do_clean=1
+                ;;
             install)
                 shift
                 local do_install=1
@@ -208,11 +265,13 @@ commandLineInterface() {
         echo "creating initial package list: '$LIST_FILE'"
         createInitialPackageList
     else
-        if [ -z "$do_remove" ] && [ -z "$do_update" ] && [ -z "$do_install" ]; then
+        if [ -z "$do_remove" ] && [ -z "$do_update" ] && [ -z "$do_install" ] \
+            && [ -z "$do_clean" ] && [ -z "$do_update_info" ]; then
             printHelpMessage "$0"
             exit 1
         fi
     fi
+    checkDuplicates
     if [ -n "$DRY_RUN" ]; then
         echo "NOTE: -d(--dry-run) is set, operations wont do anything"
     fi
@@ -227,6 +286,14 @@ commandLineInterface() {
     if [ -n "$do_install" ]; then
         echo "checking if packages are missing... "
         installMissing
+    fi
+    if [ -n "$do_clean" ]; then
+        echo "cleaning package-list..."
+        cleanMissing
+    fi
+    if [ -n "$do_update_info" ];then
+        echo "updating package infos"
+        updatePackageListInfo
     fi
     echo "all done!"
 }
